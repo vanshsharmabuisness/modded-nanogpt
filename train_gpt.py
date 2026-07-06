@@ -463,6 +463,8 @@ class NorMuonAndAdam:
         self.split_embed = False
         self._lm_head_param = self._param_by_label.get("lm_head")
         self._embed_param = self._param_by_label.get("embed")
+        self._global_step = 0
+        self._warmup_steps = 345
 
     def _build_param_cfg(self, param: nn.Parameter, label: str):
         """Build config for a single parameter from param_table."""
@@ -732,6 +734,7 @@ class NorMuonAndAdam:
         - We add embed.grad.T into lm_head.grad before comms.
         - After lm_head gather, we copy lm_head.data.T --> embed.data
         """
+        self._global_step += 1
         rank = dist.get_rank() if dist.is_initialized() else 0
         lm_param, embed_param = self._lm_head_param, self._embed_param
 
@@ -870,12 +873,30 @@ class NorMuonAndAdam:
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Fused Nesterov momentum + Polar Express orthogonalization
+        # Hybrid: Pure Polar Express for warmup, adaptive alpha after
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
-            split_baddbmm=is_large_matrix,
-        )
+        if self._global_step <= self._warmup_steps:
+            # Phase 1: standard Polar Express (alpha=0)
+            v_chunk = polar_express(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+                split_baddbmm=is_large_matrix,
+            )
+        else:
+            # Phase 2: soft polar express with adaptive alpha
+            v_chunk = polar_express(
+                grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+                split_baddbmm=is_large_matrix,
+            )
+            # compute alpha from gradient SNR (every 20 steps)
+            if self._global_step % 20 == 0:
+                S = torch.linalg.svdvals(grad_chunk.float().view(-1, grad_chunk.shape[-1]))
+                snr = S.mean() / (S.std() + 1e-7)
+                p_state["alpha"] = (1.0 - 1.0 / (1.0 + snr**2)).item()
+            alpha = p_state.get("alpha", 0.0)
+            # blend: (1-alpha)*ortho + alpha*normalized_grad
+            g_norm = grad_chunk.norm() + 1e-7
+            g_normalized = grad_chunk / g_norm
+            v_chunk = (1 - alpha) * v_chunk + alpha * g_normalized.bfloat16()
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
